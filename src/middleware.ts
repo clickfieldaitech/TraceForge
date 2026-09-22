@@ -35,6 +35,18 @@ function rateLimitResponse(resetAt: number): NextResponse {
   })
 }
 
+// The MCP server (Claude-as-PA) is a machine-to-machine endpoint with its
+// own independent Bearer-token auth (checked inside the route handler
+// itself, against MCP_ACCESS_TOKEN) — it never has a Supabase session
+// cookie, and its caller is an MCP client, not a browser page served by
+// this app. Two things below would otherwise break it if left to apply
+// here: the CSRF origin check (an MCP client sends no Origin/Referer
+// matching this app's own URL — it isn't one), and updateSession (which
+// redirects an unauthenticated request to /login, turning every tool call
+// into a 307 instead of a JSON-RPC response). The general API rate limit
+// still applies below — that's good hygiene, not a browser-session concern.
+const isMcpRoute = (pathname: string) => pathname.startsWith("/api/mcp")
+
 export async function middleware(request: NextRequest) {
   const { pathname } = request.nextUrl
   const method = request.method
@@ -57,6 +69,10 @@ export async function middleware(request: NextRequest) {
   if (pathname.startsWith("/api")) {
     const { allowed, resetAt } = await checkRateLimit(`api:${ip}`, API_LIMIT, API_WINDOW_MS)
     if (!allowed) return rateLimitResponse(resetAt)
+  }
+
+  if (isMcpRoute(pathname)) {
+    return NextResponse.next()
   }
 
   // ── CSRF: reject state-mutating requests from foreign origins ────────────
