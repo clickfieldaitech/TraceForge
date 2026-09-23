@@ -1,7 +1,8 @@
 import { requireAuth } from "@/lib/auth"
 import { must } from "@/lib/db"
 import { formatInr, formatQty } from "@/lib/format"
-import { MaterialReportDateRange } from "@/components/inventory/material-report-date-range"
+import { MaterialReportFilters } from "@/components/inventory/material-report-filters"
+import { MaterialReportExportCsv } from "@/components/inventory/material-report-export-csv"
 import { PrintButton } from "@/components/job-cards/print-button"
 
 export const metadata = { title: "Material Report — ValveTrack" }
@@ -13,8 +14,8 @@ type LedgerRow = {
   unit_rate: number
   reference_type: string
   created_at: string
-  item_master: { item_code: string; item_name: string; uom: string } | null
-  storage_locations: { code: string } | null
+  item_master: { item_code: string; item_name: string; uom: string; consumable_type: string | null } | null
+  storage_locations: { id: string; code: string } | null
 }
 
 type ItemSummary = {
@@ -38,7 +39,7 @@ type ItemSummary = {
 export default async function MaterialReportPage({
   searchParams,
 }: {
-  searchParams: Promise<{ from?: string; to?: string }>
+  searchParams: Promise<{ from?: string; to?: string; type?: string; location?: string; txn?: string }>
 }) {
   const { supabase } = await requireAuth()
   const sp = await searchParams
@@ -47,16 +48,39 @@ export default async function MaterialReportPage({
   const firstOfMonth = `${today.slice(0, 7)}-01`
   const from = sp.from || firstOfMonth
   const to = sp.to || today
+  const typeFilter = sp.type || "all"
+  const locationFilter = sp.location || "all"
+  const txnFilter = sp.txn || "all"
 
-  const ledgerRes = await supabase
-    .from("stock_ledger")
-    .select("id, transaction_type, qty, unit_rate, reference_type, created_at, item_master(item_code, item_name, uom), storage_locations(code)")
-    .gte("created_at", `${from}T00:00:00`)
-    .lte("created_at", `${to}T23:59:59.999`)
-    .order("created_at", { ascending: true })
-    .limit(5000)
+  const [ledgerRes, locationsRes] = await Promise.all([
+    supabase
+      .from("stock_ledger")
+      .select("id, transaction_type, qty, unit_rate, reference_type, created_at, item_master(item_code, item_name, uom, consumable_type), storage_locations(id, code)")
+      .gte("created_at", `${from}T00:00:00`)
+      .lte("created_at", `${to}T23:59:59.999`)
+      .order("created_at", { ascending: true })
+      .limit(5000),
+    supabase.from("storage_locations").select("id, code, name").eq("is_active", true).order("code"),
+  ])
 
-  const rows = must(ledgerRes, "material ledger for this period") as unknown as LedgerRow[]
+  const allRows = must(ledgerRes, "material ledger for this period") as unknown as LedgerRow[]
+  const locations = must(locationsRes, "storage locations")
+
+  // Filtering happens once, here, so the summary table, the transaction
+  // detail table, the CSV export and the print view (which is just this same
+  // page with window.print()) can never disagree about what "filtered" means.
+  const rows = allRows.filter((r) => {
+    if (typeFilter !== "all" && r.item_master?.consumable_type !== typeFilter) return false
+    if (locationFilter !== "all" && r.storage_locations?.id !== locationFilter) return false
+    if (txnFilter !== "all" && r.transaction_type !== txnFilter) return false
+    return true
+  })
+
+  const activeFilterLabel = [
+    typeFilter !== "all" ? `${typeFilter[0].toUpperCase()}${typeFilter.slice(1)}` : null,
+    locationFilter !== "all" ? locations.find((l) => l.id === locationFilter)?.code : null,
+    txnFilter !== "all" ? txnFilter.replace(/_/g, " ") : null,
+  ].filter(Boolean).join(" · ")
 
   const summaryByItem = new Map<string, ItemSummary>()
   for (const r of rows) {
@@ -84,25 +108,37 @@ export default async function MaterialReportPage({
 
   return (
     <div className="mx-auto max-w-5xl space-y-5 p-6 print:max-w-none print:p-0">
-      <div className="flex items-center justify-between print:hidden">
+      <div className="flex flex-wrap items-center justify-between gap-3 print:hidden">
         <div>
           <h1 className="text-2xl font-semibold tracking-tight">Material Report</h1>
           <p className="mt-1 text-sm text-muted-foreground">Stock movement for a chosen date range, printable.</p>
         </div>
-        <PrintButton label="Print Report" />
+        <div className="flex items-center gap-2">
+          <MaterialReportExportCsv rows={rows} from={from} to={to} typeFilter={typeFilter} />
+          <PrintButton label="Print Report" />
+        </div>
       </div>
 
-      <MaterialReportDateRange from={from} to={to} />
+      <MaterialReportFilters
+        from={from}
+        to={to}
+        typeFilter={typeFilter}
+        locationFilter={locationFilter}
+        txnFilter={txnFilter}
+        locations={locations}
+      />
 
       <header className="hidden border-b-2 border-foreground pb-3 print:block">
         <h1 className="text-xl font-semibold">MATERIAL REPORT</h1>
         <p className="text-sm text-muted-foreground">
           Raghav Engineering · {new Date(from).toLocaleDateString("en-IN")} to {new Date(to).toLocaleDateString("en-IN")}
+          {activeFilterLabel && ` · ${activeFilterLabel}`}
         </p>
       </header>
 
       <p className="text-sm text-muted-foreground print:hidden">
         Showing {new Date(from).toLocaleDateString("en-IN")} to {new Date(to).toLocaleDateString("en-IN")}
+        {activeFilterLabel && ` · ${activeFilterLabel}`}
         {" · "}{rows.length} ledger entries across {summary.length} items
       </p>
 
