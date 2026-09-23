@@ -11,12 +11,6 @@ import { validateFileSignature } from "@/lib/documents/file-signature"
 import type { WpsMasterStatus } from "@/types/database"
 import { sanitizeError } from "@/lib/security"
 
-// extractWpsFromDocument can fall back across Gemini models with per-attempt
-// timeouts totalling up to ~56s worst case (see wps-extraction.ts) — the
-// platform default (10s) would kill it mid-fallback, turning a recoverable
-// 503 into a hard failure before the fallback model even got a turn.
-export const maxDuration = 60
-
 // ─────────────────────────────────────────────────────────────────────────────
 // Helpers
 // ─────────────────────────────────────────────────────────────────────────────

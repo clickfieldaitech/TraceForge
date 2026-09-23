@@ -8,6 +8,10 @@ import type { WpsMaster, UserRole } from "@/types/database"
 
 export const metadata = { title: "Edit WPS Master — ValveTrack" }
 
+// See new/page.tsx for why this lives here — the extract dialog is also
+// reachable from the edit form, so it needs the same longer budget.
+export const maxDuration = 60
+
 export default async function EditWpsMasterPage({
   params,
 }: {

@@ -7,6 +7,14 @@ import type { UserRole } from "@/types/database"
 
 export const metadata = { title: "New WPS Master — ValveTrack" }
 
+// The "Extract from PDF/Image" action on this page's form can fall back
+// across Gemini models with per-attempt timeouts totalling up to ~56s worst
+// case (see wps-extraction.ts) — the platform's shorter default would kill
+// it mid-fallback. Server Actions inherit the maxDuration of the route that
+// invokes them, which is why this lives here rather than in actions.ts (a
+// "use server" file can only export async functions, not config consts).
+export const maxDuration = 60
+
 export default async function NewWpsMasterPage() {
   const { profile } = await requireAuth()
   const role = (profile?.role ?? "operator") as UserRole
