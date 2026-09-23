@@ -88,6 +88,31 @@ export type WpsExtractionResult =
   | { data: Record<string, unknown> }
   | { error: string }
 
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+// Gemini's structured-output mode (responseSchema, which this call relies on)
+// intermittently returns 503 "high demand" under normal Google-side load —
+// observed ~1-in-3 requests failing this way even when the API key, quota,
+// and payload are all fine. Retrying almost always succeeds within a couple
+// of attempts, so retry automatically instead of making the user re-click.
+const MAX_ATTEMPTS = 3
+const RETRY_BASE_DELAY_MS = 1500
+
+async function callGemini(apiKey: string, body: unknown): Promise<Response | { networkError: true }> {
+  try {
+    return await fetch(`${GEMINI_ENDPOINT}?key=${apiKey}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(60_000),
+    })
+  } catch {
+    return { networkError: true }
+  }
+}
+
 export async function extractWpsFromFile(
   bytes: Buffer,
   mimeType: string,
@@ -113,16 +138,29 @@ export async function extractWpsFromFile(
     },
   }
 
-  let res: Response
-  try {
-    res = await fetch(`${GEMINI_ENDPOINT}?key=${apiKey}`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-      signal: AbortSignal.timeout(60_000),
-    })
-  } catch {
-    return { error: "Could not reach the extraction service. Please try again." }
+  let res: Response | undefined
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    const result = await callGemini(apiKey, body)
+
+    if ("networkError" in result) {
+      if (attempt === MAX_ATTEMPTS) return { error: "Could not reach the extraction service. Please try again." }
+      await sleep(RETRY_BASE_DELAY_MS * attempt)
+      continue
+    }
+
+    // Only 503 (transient overload) is worth retrying — a 4xx means the
+    // request itself is wrong and will fail identically every time.
+    if (result.status === 503 && attempt < MAX_ATTEMPTS) {
+      await sleep(RETRY_BASE_DELAY_MS * attempt)
+      continue
+    }
+
+    res = result
+    break
+  }
+
+  if (!res) {
+    return { error: "Extraction failed after multiple attempts. Please try again or fill the form manually." }
   }
 
   if (!res.ok) {
