@@ -8,11 +8,19 @@
 // to avoid a new dependency, matching how Supabase/Resend are called
 // elsewhere in this codebase.
 
-// "gemini-flash-latest" is Google's maintained alias for their current
-// recommended flash model — avoids hardcoding a version that later gets
-// deprecated for new API keys (as happened with "gemini-2.5-flash").
-const GEMINI_MODEL = "gemini-flash-latest"
-const GEMINI_ENDPOINT = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`
+// Two Google-maintained aliases, tried in order — never a hardcoded version
+// number (that's what deprecated "gemini-2.5-flash" out from under us: it
+// now 404s with "no longer available to new users"). "-latest" always
+// resolves to Google's current full model, which is fastest to get new
+// capabilities but also the first place everyone's traffic lands right after
+// a release, causing real, observed 503 "high demand" spells lasting well
+// past a few retries (20-30s per failed attempt, ~2 in 3 failing). The
+// "-lite" alias is a smaller, separately-provisioned model with its own
+// capacity pool — reliably fast even while the full model is overloaded — so
+// it's a genuine fallback, not just hitting the same congestion twice.
+const GEMINI_MODELS = ["gemini-flash-latest", "gemini-flash-lite-latest"] as const
+const GEMINI_ENDPOINT = (model: string) =>
+  `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`
 
 export function isWpsExtractionConfigured(): boolean {
   return !!process.env.GEMINI_API_KEY
@@ -92,21 +100,31 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms))
 }
 
-// Gemini's structured-output mode (responseSchema, which this call relies on)
-// intermittently returns 503 "high demand" under normal Google-side load —
-// observed ~1-in-3 requests failing this way even when the API key, quota,
-// and payload are all fine. Retrying almost always succeeds within a couple
-// of attempts, so retry automatically instead of making the user re-click.
-const MAX_ATTEMPTS = 3
-const RETRY_BASE_DELAY_MS = 1500
+// Per model: how many attempts, and how long to wait before giving up on one
+// attempt and moving on. The full model gets exactly one shot with a tight
+// timeout — when it's overloaded it takes 20-30s to even fail, so a second
+// attempt on it just burns the function's time budget for the same bad odds.
+// The lite model gets two attempts with a longer timeout since it's small
+// and fast (~2s observed) even while the full model is struggling; a rare
+// slow lite response still deserves its full timeout rather than an early cut.
+const ATTEMPT_PLAN: Record<(typeof GEMINI_MODELS)[number], { attempts: number; timeoutMs: number }> = {
+  "gemini-flash-latest": { attempts: 1, timeoutMs: 15_000 },
+  "gemini-flash-lite-latest": { attempts: 2, timeoutMs: 20_000 },
+}
+const RETRY_BACKOFF_MS = 1_500
 
-async function callGemini(apiKey: string, body: unknown): Promise<Response | { networkError: true }> {
+async function callGemini(
+  model: string,
+  apiKey: string,
+  body: unknown,
+  timeoutMs: number,
+): Promise<Response | { networkError: true }> {
   try {
-    return await fetch(`${GEMINI_ENDPOINT}?key=${apiKey}`, {
+    return await fetch(`${GEMINI_ENDPOINT(model)}?key=${apiKey}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
-      signal: AbortSignal.timeout(60_000),
+      signal: AbortSignal.timeout(timeoutMs),
     })
   } catch {
     return { networkError: true }
@@ -138,29 +156,40 @@ export async function extractWpsFromFile(
     },
   }
 
+  // `res` ends up holding either the first non-503 response (success or a
+  // real 4xx we should report as-is) or, if every model/attempt came back
+  // 503, the last 503 seen — undefined only if every attempt threw
+  // (network-level failure, not an HTTP response at all).
   let res: Response | undefined
-  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-    const result = await callGemini(apiKey, body)
+  outer: for (const model of GEMINI_MODELS) {
+    const { attempts, timeoutMs } = ATTEMPT_PLAN[model]
+    for (let attempt = 1; attempt <= attempts; attempt++) {
+      const result = await callGemini(model, apiKey, body, timeoutMs)
 
-    if ("networkError" in result) {
-      if (attempt === MAX_ATTEMPTS) return { error: "Could not reach the extraction service. Please try again." }
-      await sleep(RETRY_BASE_DELAY_MS * attempt)
-      continue
+      if ("networkError" in result) {
+        if (attempt < attempts) await sleep(RETRY_BACKOFF_MS)
+        continue
+      }
+
+      // 503 (transient overload) and 429 (rate limit — real on the free
+      // tier, and more likely to trip here since a fallback attempt is a
+      // second request) are both worth retrying/falling back on. Any other
+      // 4xx means the request itself is wrong and will fail identically on
+      // every model, so report it immediately instead of burning the
+      // remaining time budget on attempts that can't succeed.
+      if (result.status === 503 || result.status === 429) {
+        res = result
+        if (attempt < attempts) await sleep(RETRY_BACKOFF_MS)
+        continue
+      }
+
+      res = result
+      break outer
     }
-
-    // Only 503 (transient overload) is worth retrying — a 4xx means the
-    // request itself is wrong and will fail identically every time.
-    if (result.status === 503 && attempt < MAX_ATTEMPTS) {
-      await sleep(RETRY_BASE_DELAY_MS * attempt)
-      continue
-    }
-
-    res = result
-    break
   }
 
   if (!res) {
-    return { error: "Extraction failed after multiple attempts. Please try again or fill the form manually." }
+    return { error: "Could not reach the extraction service. Please try again." }
   }
 
   if (!res.ok) {
